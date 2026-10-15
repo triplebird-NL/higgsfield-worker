@@ -10,11 +10,13 @@ const HOST = process.env.HIGGSFIELD_WORKER_HOST ?? "127.0.0.1";
 const CLI = process.env.HIGGSFIELD_CLI ?? "higgsfield";
 const WORKER_SECRET = process.env.HIGGSFIELD_WORKER_SECRET ?? "";
 const WORKSPACE_ID = process.env.HIGGSFIELD_WORKSPACE_ID ?? "";
-const MODEL = process.env.HIGGSFIELD_MODEL ?? "kling3_0";
+const MODEL = process.env.HIGGSFIELD_MODEL ?? "seedance_2_0_mini";
 const MODE = process.env.HIGGSFIELD_MODE ?? "pro";
 const ASPECT_RATIO = process.env.HIGGSFIELD_ASPECT_RATIO ?? "9:16";
 const DURATION = Number(process.env.HIGGSFIELD_DURATION ?? 10);
+const RESOLUTION = process.env.HIGGSFIELD_RESOLUTION ?? "720p";
 const SOUND = process.env.HIGGSFIELD_SOUND === "off" ? "off" : "on";
+const ALLOWED_VIDEO_MODELS = new Set(["seedance_2_0_mini", "kling3_0", "kling3_0_turbo"]);
 const WAIT_TIMEOUT = process.env.HIGGSFIELD_WAIT_TIMEOUT ?? "15m";
 // Fallback image generation (see /generate-image below) — used when the
 // main app's direct Gemini call is blocked by Gemini's own IMAGE_SAFETY
@@ -276,20 +278,79 @@ async function downloadSourceImage(body, directory) {
   return path;
 }
 
+function canonicalizeVideoModel(model) {
+  const raw = String(model ?? "").trim();
+  if (!raw) return MODEL;
+  const key = raw.toLowerCase().replace(/[.\s-]+/g, "_").replace(/_+/g, "_");
+  if (
+    key === "seedance_2_0_mini" ||
+    key === "seedance_2_0" ||
+    key === "seedance20mini" ||
+    key === "seedance_20_mini"
+  ) {
+    return "seedance_2_0_mini";
+  }
+  if (ALLOWED_VIDEO_MODELS.has(raw)) return raw;
+  if (ALLOWED_VIDEO_MODELS.has(key)) return key;
+  return null;
+}
+
+function isSeedanceMini(model) {
+  return model === "seedance_2_0_mini";
+}
+
+function buildVideoCreateArgs({
+  model,
+  prompt,
+  imagePath,
+  duration,
+  aspectRatio,
+  mode,
+  sound,
+  resolution,
+}) {
+  const args = [
+    "generate",
+    "create",
+    model,
+    "--prompt",
+    prompt,
+    "--start-image",
+    imagePath,
+    "--duration",
+    String(duration),
+    "--aspect_ratio",
+    aspectRatio,
+  ];
+  if (isSeedanceMini(model)) {
+    args.push("--resolution", resolution);
+    args.push("--generate_audio", sound === "off" ? "false" : "true");
+  } else {
+    args.push("--mode", mode);
+    args.push("--sound", sound);
+  }
+  args.push("--wait", "--wait-timeout", WAIT_TIMEOUT, "--json", "--no-color");
+  return args;
+}
+
 async function generate(body) {
   if (typeof body.prompt !== "string" || !body.prompt.trim()) {
     throw new Error("prompt is required");
   }
 
-  const model = typeof body.model === "string" && body.model ? body.model : MODEL;
+  const requestedModel = typeof body.model === "string" && body.model ? body.model : MODEL;
+  const model = canonicalizeVideoModel(requestedModel);
   const duration = Number(body.duration ?? DURATION);
   const mode = typeof body.mode === "string" && body.mode ? body.mode : MODE;
   const aspectRatio =
     typeof body.aspect_ratio === "string" && body.aspect_ratio ? body.aspect_ratio : ASPECT_RATIO;
   const sound = typeof body.sound === "string" && body.sound ? body.sound : SOUND;
+  const requestedResolution =
+    typeof body.resolution === "string" && body.resolution ? body.resolution : RESOLUTION;
+  const resolution = isSeedanceMini(model) ? "720p" : requestedResolution;
 
-  if (!/^kling3_0(?:_turbo)?$/.test(model)) {
-    throw new Error(`Unsupported Higgsfield video model: ${model}`);
+  if (!model) {
+    throw new Error(`Unsupported Higgsfield video model: ${requestedModel}`);
   }
   if (!Number.isInteger(duration) || duration < 3 || duration > 15) {
     throw new Error("duration must be an integer between 3 and 15 seconds");
@@ -304,28 +365,16 @@ async function generate(body) {
   const directory = await fs.mkdtemp(join(tmpdir(), "higgsfield-worker-"));
   try {
     const imagePath = await downloadSourceImage(body, directory);
-    const args = [
-      "generate",
-      "create",
+    const args = buildVideoCreateArgs({
       model,
-      "--prompt",
-      body.prompt.trim(),
-      "--start-image",
+      prompt: body.prompt.trim(),
       imagePath,
-      "--duration",
-      String(duration),
-      "--aspect_ratio",
+      duration,
       aspectRatio,
-      "--mode",
       mode,
-      "--sound",
       sound,
-      "--wait",
-      "--wait-timeout",
-      WAIT_TIMEOUT,
-      "--json",
-      "--no-color",
-    ];
+      resolution,
+    });
     const { stdout } = await runCliWithApiRetry(args);
     const result = parseCliJson(stdout);
     const resultUrl = findResultUrl(result);
